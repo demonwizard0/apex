@@ -425,73 +425,64 @@ class OrchestratorV2(BaseModel):
                 logger.error(f"Failed to execute {request.tool_name}: {e}")
                 return None
 
-        async def extract_facts_from_result(self, result: ToolResult | None = None):
-            """Extract key facts from a tool result and store them in the fact vault"""
-            if result is None:
-                return
-            prompt = f"""Given the result of a tool execution, extract key facts and insights.
-
-            Tool: {result.tool_name}
-            Purpose: {result.purpose}
-            Result: {json.dumps(result.result, indent=2)}
-
-            Format your response as a JSON array of fact objects, where each fact has:
-            - statement: A clear, concise statement of the fact
-            - confidence: A number between 0 and 1 indicating confidence in this fact
-            - source: Where this fact came from (e.g. specific URL or tool output)
-            - context: Any important context or caveats about this fact
-
-            Example:
-            [
-                {{
-                    "statement": "The Great Pyramid was built around 2560 BCE",
-                    "confidence": 0.95,
-                    "source": "https://example.com/pyramids",
-                    "context": "Date based on archaeological evidence and historical records"
-                }}
-            ]"""
-
-            messages = [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "Please extract key facts from the tool result."},
-            ]
-
-            facts_output, query_record = await make_mistral_request(
-                messages, f"extract_facts_{result.tool_name}", completions=self.completions, debug=self.debug
-            )
-
-            try:
-                facts = parse_llm_json(facts_output)
-                query_record.parsed_response = facts
-                self.query_history.append(query_record)
-                self.fact_vault.extend(facts)
-                logger.info(f"Extracted {len(facts)} facts from {result.tool_name} result")
-            except Exception as e:
-                logger.error(f"Failed to parse facts from {result.tool_name}: {e}")
-
-            # Execute all tool requests concurrently
-            tool_results = await asyncio.gather(*[execute_single_tool(request) for request in tool_requests])
-
-            # Filter out None results (from failed executions) and record successful results
-            results = [result for result in tool_results if result is not None]
-            self.tool_history.extend(results)
-
-            return results
-
-        # 🔄 Step 1: Run tools concurrently
+        # Execute all tool requests concurrently
         tool_results = await asyncio.gather(*[execute_single_tool(request) for request in tool_requests])
 
-        # ✅ Step 2: Keep only successful ones
+        # Filter out None results (from failed executions) and record successful results
         results = [result for result in tool_results if result is not None]
         self.tool_history.extend(results)
 
-        # 🧠 Step 3: Extract facts from successful tool results
+        # Extract facts from successful tool results
         if results:
             for result in results:
                 await self.extract_facts_from_result(result)
-                # look into returning the extracted facts instead
 
         return results
+
+    @with_retries(max_retries=3)
+    async def extract_facts_from_result(self, result: ToolResult | None = None):
+        """Extract key facts from a tool result and store them in the fact vault"""
+        if result is None:
+            return
+        prompt = f"""Given the result of a tool execution, extract key facts and insights.
+
+        Tool: {result.tool_name}
+        Purpose: {result.purpose}
+        Result: {json.dumps(result.result, indent=2)}
+
+        Format your response as a JSON array of fact objects, where each fact has:
+        - statement: A clear, concise statement of the fact
+        - confidence: A number between 0 and 1 indicating confidence in this fact
+        - source: Where this fact came from (e.g. specific URL or tool output)
+        - context: Any important context or caveats about this fact
+
+        Example:
+        [
+            {{
+                "statement": "The Great Pyramid was built around 2560 BCE",
+                "confidence": 0.95,
+                "source": "https://example.com/pyramids",
+                "context": "Date based on archaeological evidence and historical records"
+            }}
+        ]"""
+
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "Please extract key facts from the tool result."},
+        ]
+
+        facts_output, query_record = await make_mistral_request(
+            messages, f"extract_facts_{result.tool_name}", completions=self.completions, debug=self.debug
+        )
+
+        try:
+            facts = parse_llm_json(facts_output)
+            query_record.parsed_response = facts
+            self.query_history.append(query_record)
+            self.fact_vault.extend(facts)
+            logger.info(f"Extracted {len(facts)} facts from {result.tool_name} result")
+        except Exception as e:
+            logger.error(f"Failed to parse facts from {result.tool_name}: {e}")
 
     async def run(self, messages):
         logger.info("Starting orchestration run")
