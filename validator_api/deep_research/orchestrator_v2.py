@@ -18,7 +18,7 @@ from validator_api.web_retrieval import web_retrieval
 
 shared_settings = SharedSettings.load(mode="validator")
 
-
+ 
 def make_chunk(text):
     chunk = json.dumps({"choices": [{"delta": {"content": text}}]})
     return f"data: {chunk}\n\n"
@@ -403,7 +403,6 @@ class OrchestratorV2(BaseModel):
 
     async def execute_tools(self, tool_requests: list[ToolRequest]) -> list[ToolResult]:
         """Executes the requested tools and records their results"""
-        results = []
 
         async def execute_single_tool(request: ToolRequest) -> ToolResult | None:
             logger.info(f"Executing {request.tool_name} - Purpose: {request.purpose}")
@@ -417,25 +416,41 @@ class OrchestratorV2(BaseModel):
                     result=result,
                     purpose=request.purpose,
                 )
-                results.append(tool_result)
-                self.tool_history.append(tool_result)
                 return tool_result
+            
+            except asyncio.CancelledError:
+                logger.warning(f"Execution of {request.tool_name} was cancelled.")
+                raise  # Important: propagate cancellation immediately
 
             except Exception as e:
                 logger.error(f"Failed to execute {request.tool_name}: {e}")
-                return None
+                return None  # Normal failure = just skip
 
         # Execute all tool requests concurrently
-        tool_results = await asyncio.gather(*[execute_single_tool(request) for request in tool_requests])
+        try:
+            tool_results = await asyncio.gather(
+                *[execute_single_tool(request) for request in tool_requests],
+                return_exceptions=False  # CancelledError must propagate
+            )
+        except Exception as e:
+            logger.error(f"Failed to execute tools: {e}")
+            raise
 
         # Filter out None results (from failed executions) and record successful results
-        results = [result for result in tool_results if result is not None]
-        self.tool_history.extend(results)
+        results = [
+            result for result in tool_results
+            if result is not None and not isinstance(result, Exception)
+        ]
+        logger.debug(f"Tool results: {json.dumps(results, indent=2)}")
+        self.tool_history.extend(results) # This may not be needed, due to summarization step
 
         # Extract facts from successful tool results
         if results:
             for result in results:
-                await self.extract_facts_from_result(result)
+                try:
+                    await self.extract_facts_from_result(result)
+                except Exception as e:
+                    logger.error(f"Failed to extract facts from {result.tool_name}: {e}")
 
         return results
 
@@ -444,6 +459,7 @@ class OrchestratorV2(BaseModel):
         """Extract key facts from a tool result and store them in the fact vault"""
         if result is None:
             return
+        
         prompt = f"""Given the result of a tool execution, extract key facts and insights.
 
         Tool: {result.tool_name}
@@ -460,7 +476,6 @@ class OrchestratorV2(BaseModel):
         [
             {{
                 "statement": "The Great Pyramid was built around 2560 BCE",
-                "confidence": 0.95,
                 "source": "https://example.com/pyramids",
                 "context": "Date based on archaeological evidence and historical records"
             }}
@@ -472,11 +487,19 @@ class OrchestratorV2(BaseModel):
         ]
 
         facts_output, query_record = await make_mistral_request(
-            messages, f"extract_facts_{result.tool_name}", completions=self.completions, debug=self.debug
+            messages, 
+            f"extract_facts_{result.tool_name}", 
+            completions=self.completions, 
+            debug=self.debug
         )
+
+        if not facts_output:
+            logger.warning(f"No facts returned for {result.tool_name}")
+            return
 
         try:
             facts = parse_llm_json(facts_output)
+
             query_record.parsed_response = facts
             self.query_history.append(query_record)
             self.fact_vault.extend(facts)
@@ -776,8 +799,6 @@ if __name__ == "__main__":
     async def main():
         orchestrator = OrchestratorV2()
         try:
-            # We would need a real completions function here, but since this is just an example,
-            # we'll use None and it will fail gracefully
             async for chunk in orchestrator.run(
                 messages=[{"role": "user", "content": "How can I implement a prompt engineering project?"}],
                 completions=None,
