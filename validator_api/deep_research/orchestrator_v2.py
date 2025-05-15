@@ -14,6 +14,13 @@ from validator_api.deep_research.utils import extract_content_from_stream, parse
 from validator_api.serializers import CompletionsRequest, WebRetrievalRequest
 from validator_api.web_retrieval import web_retrieval
 
+from dotenv import load_dotenv
+import os
+
+# Explicitly load from .env.api to get Mistral api key
+load_dotenv(dotenv_path=".env.api")
+
+
 
 def make_chunk(text):
     chunk = json.dumps({"choices": [{"delta": {"content": text}}]})
@@ -148,31 +155,11 @@ async def make_mistral_request(
 ) -> tuple[str, LLMQuery]:
     """Makes a request to Mistral API and records the query"""
 
-    model = "mrfakename/mistral-small-3.1-24b-instruct-2503-hf"
-    temperature = 0.15
-    top_p = 1
-    max_tokens = 128000
-    sample_params = {
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "do_sample": False,
-    }
-    logger.info(f"Making request to Mistral API with model: {model}")
-    request = CompletionsRequest(
-        messages=messages,
-        model=model,
-        stream=True,
-        sampling_parameters=sample_params,
-    )
-    # Iterate over the response then collect the content
-    response = await completions(request)
-    response_content = await extract_content_from_stream(response)
-    logger.info(f"Response content: {response_content}")
-    if not response_content:
-        raise ValueError(f"No response content received from Mistral API, response: {response}")
-    if "Error" in response_content:
-        raise ValueError(f"Error in Mistral API response: {response_content}")
+    from mistralai import Mistral
+    client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+    model = "mistral-small-latest"
+    chat_response = client.chat.complete(model=model, messages=messages)
+    response_content = chat_response.choices[0].message.content.strip().lower().rstrip(".")
     query_record = LLMQuery(
         messages=messages, raw_response=response_content, step_name=step_name, timestamp=time.time(), model=model
     )
