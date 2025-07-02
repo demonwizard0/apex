@@ -1,11 +1,21 @@
 import json
 import re
+import time
 import traceback
+from datetime import datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from fastapi.responses import StreamingResponse
 from loguru import logger
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+
+from validator_api.serializers import CompletionsRequest, WebRetrievalRequest
+from validator_api.web_retrieval import web_retrieval
+
+from .models import LLMQuery
+
+STEP_MAX_RETRIES = 10
 
 
 def parse_llm_json(json_str: str, allow_empty: bool = True) -> dict[str, Any]:
@@ -141,3 +151,160 @@ async def extract_content_from_stream(streaming_response: StreamingResponse) -> 
                 continue  # Optionally log/handle malformed chunks
 
     return full_content
+
+
+def make_chunk(text: str) -> str:
+    """Create a streaming chunk for SSE response"""
+    chunk = json.dumps({"choices": [{"delta": {"content": text}}]})
+    return f"data: {chunk}\n\n"
+
+
+def get_current_datetime_str() -> str:
+    """Returns a nicely formatted string of the current date and time"""
+    return datetime.now().strftime("%B %d, %Y")
+
+
+@retry(
+    stop=stop_after_attempt(STEP_MAX_RETRIES),
+    wait=wait_fixed(2),
+    retry=retry_if_exception_type(json.JSONDecodeError),
+)
+async def make_mistral_request_with_json(
+    messages: list[dict[str, Any]],
+    step_name: str,
+    completions: Callable[[CompletionsRequest], Awaitable[StreamingResponse]],
+) -> tuple[str, LLMQuery]:
+    """Makes a request to Mistral API and ensures response is valid JSON"""
+
+    raw_response, query_record = await make_mistral_request(
+        messages,
+        step_name,
+        completions,
+    )
+    try:
+        parse_llm_json(raw_response)  # Test if the response is jsonable
+        return raw_response, query_record
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Mistral API response as JSON: {e}")
+        raise
+
+
+@retry(
+    stop=stop_after_attempt(STEP_MAX_RETRIES),
+    wait=wait_fixed(2),
+    retry=retry_if_exception_type(BaseException),
+)
+async def make_mistral_request(
+    messages: list[dict[str, Any]],
+    step_name: str,
+    completions: Callable[[CompletionsRequest], Awaitable[StreamingResponse]],
+) -> tuple[str, LLMQuery]:
+    """Makes a request to Mistral API and records the query"""
+
+    model = "mrfakename/mistral-small-3.1-24b-instruct-2503-hf"
+    temperature = 0.15
+    top_p = 1
+    max_tokens = 6144
+    sample_params: dict[str, Any] = {
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "do_sample": False,
+    }
+    request = CompletionsRequest(
+        messages=messages,
+        model=model,
+        stream=True,
+        sampling_parameters=sample_params,
+        timeout=120,
+    )
+    response = await completions(request)
+
+    response_content = await extract_content_from_stream(response)
+
+    logger.debug(f"Response content: {response_content}")
+    if not response_content:
+        raise ValueError(f"No response content received from Mistral API, response: {response}")
+    if "Error" in response_content:
+        raise ValueError(f"Error in Mistral API response: {response_content}")
+
+    query_record = LLMQuery(
+        messages=messages, raw_response=response_content, step_name=step_name, timestamp=time.time(), model=model
+    )
+
+    return response_content, query_record
+
+
+async def search_web(question: str, n_results: int = 2, completions=None) -> dict:
+    """
+    Takes a natural language question, generates an optimized search query, performs web search,
+    and returns a referenced answer based on the search results.
+    """
+    # Generate optimized search query
+    query_prompt = """Given a natural language question, generate an optimized web search query.
+Focus on extracting key terms and concepts while removing unnecessary words.
+Format your response as a single line containing only the optimized search query."""
+
+    messages = [{"role": "system", "content": query_prompt}, {"role": "user", "content": question}]
+
+    optimized_query, query_record = await make_mistral_request(
+        messages, "optimize_search_query", completions=completions
+    )
+
+    # Perform web search
+    search_results = None
+    for i in range(STEP_MAX_RETRIES):
+        try:
+            search_results = await web_retrieval(WebRetrievalRequest(search_query=optimized_query, n_results=n_results))
+            if search_results.results:
+                break
+        except BaseException:
+            logger.warning(f"Try {i+1} failed")
+    if search_results is None or not search_results.results:
+        search_results = {"results": []}
+
+    # Generate referenced answer
+    answer_prompt = f"""Based on the provided search results, generate a concise but well-structured answer to the question.
+Include inline references to sources using markdown format [n] where n is the source number.
+
+Question: {question}
+
+Search Results:
+{json.dumps([{
+    'index': i + 1,
+    'content': result.content,
+    'url': result.url
+} for i, result in enumerate(search_results.results)], indent=2)}
+
+Format your response as a JSON object with the following structure:
+{{
+    "answer": "Your detailed answer with inline references [n]",
+    "references": [
+        {{
+            "number": n,
+            "url": "Source URL"
+        }}
+    ]
+}}"""
+
+    messages = [
+        {"role": "system", "content": answer_prompt},
+        {"role": "user", "content": "Please generate a referenced answer based on the search results."},
+    ]
+
+    raw_answer, answer_record = await make_mistral_request_with_json(
+        messages, "generate_referenced_answer", completions=completions
+    )
+    try:
+        answer_data = parse_llm_json(raw_answer)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Mistral API response as JSON: {e}")
+        raise
+
+    return {
+        "question": question,
+        "optimized_query": optimized_query,
+        "answer": answer_data["answer"],
+        "references": answer_data["references"],
+        "raw_results": [{"snippet": r.content, "url": r.url} for r in search_results.results],
+    }

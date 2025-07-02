@@ -11,7 +11,7 @@ from validator_api.chain.uid_tracker import uid_tracker
 shared_settings = settings.shared_settings
 from validator_api.api_management import validate_api_key
 from validator_api.chat_completion import chat_completion
-from validator_api.deep_research.orchestrator_v2 import OrchestratorV2
+from validator_api.deep_research.orchestrator_v3 import OrchestratorV3
 from validator_api.job_store import job_store, process_chain_of_thought_job
 from validator_api.mixture_of_miners import mixture_of_miners
 from validator_api.serializers import CompletionsRequest, JobResponse, JobResultResponse, TestTimeInferenceRequest
@@ -142,7 +142,7 @@ async def test_time_inference(request: TestTimeInferenceRequest):
     }
     ```
     """
-    orchestrator = OrchestratorV2(completions=completions)
+    orchestrator = OrchestratorV3(completions=completions)
 
     async def create_response_stream(request):
         async for chunk in orchestrator.run(messages=request.messages):
@@ -239,7 +239,7 @@ async def submit_chain_of_thought_job(
         )
 
         # Create the orchestrator
-        orchestrator = OrchestratorV2(completions=completions)
+        orchestrator = OrchestratorV3(completions=completions)
 
         # Add the background task
         background_tasks.add_task(
